@@ -1,0 +1,438 @@
+import json
+import random
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW_PATH = ROOT / "test_cases.yaml"
+DATA_DIR = ROOT / "data"
+
+random.seed(42)
+
+SECTION_TO_STATE = {
+    "patient onboarding": "onboarding",
+    "device setup": "device_setup",
+    "troubleshooting": "troubleshooting",
+    "simple education": "education",
+    "closing the chat": "closing",
+    "safety escalation": "escalation",
+}
+
+
+def normalize_section(title):
+    t = title.strip().lower()
+    t = re.sub(r"[^a-z ]+", "", t)
+    return t.strip()
+
+
+def parse_test_cases(text):
+    sections = []
+    current = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("###"):
+            title = line.replace("#", "").strip()
+            if current:
+                sections.append(current)
+            current = {"title": title, "pairs": []}
+            continue
+        if not line or line.startswith("---"):
+            continue
+        if line.lower().startswith("pair"):
+            current["pairs"].append({"user": "", "assistant": ""})
+            continue
+        if line.startswith("User:"):
+            if not current["pairs"]:
+                current["pairs"].append({"user": "", "assistant": ""})
+            current["pairs"][-1]["user"] = line[len("User:"):].strip()
+            continue
+        if line.startswith("Assistant:"):
+            if not current["pairs"]:
+                current["pairs"].append({"user": "", "assistant": ""})
+            current["pairs"][-1]["assistant"] = line[len("Assistant:"):].strip()
+            continue
+    if current:
+        sections.append(current)
+    return sections
+
+
+def expected_for_pair(section_state, user_text, assistant_text):
+    lower = user_text.lower()
+
+    if section_state == "onboarding" and "dob" in lower:
+        return {
+            "state": "onboarding",
+            "assistant_message": "Thank you. Let me verify your identity now.",
+            "tool_call": {
+                "name": "verify_identity",
+                "arguments": {
+                    "first_name": "Emily",
+                    "last_name": "Davis",
+                    "dob": "12/01/1959",
+                },
+            },
+        }
+
+    if section_state == "device_setup":
+        m = re.search(r"device id is ([A-Za-z0-9-]+)", user_text, re.I)
+        device_id = m.group(1) if m else "UNKNOWN"
+        return {
+            "state": "device_setup",
+            "assistant_message": "Got it. I'll pair your device with the tablet now.",
+            "tool_call": {
+                "name": "pair_device",
+                "arguments": {"device_id": device_id},
+            },
+        }
+
+    if section_state == "troubleshooting":
+        if "still" in lower or "doesn't work" in lower:
+            return {
+                "state": "troubleshooting",
+                "assistant_message": "Thanks for the update. I'll log this and ask a support teammate to follow up.",
+                "tool_call": {
+                    "name": "troubleshoot_step",
+                    "arguments": {"step_id": "create_support_ticket"},
+                },
+            }
+        return {
+            "state": "troubleshooting",
+            "assistant_message": "Let's try a Bluetooth reset step and then re-pair.",
+            "tool_call": {
+                "name": "troubleshoot_step",
+                "arguments": {"step_id": "bluetooth_reset"},
+            },
+        }
+
+    if section_state == "education":
+        if "ready" in lower:
+            return {
+                "state": "education",
+                "assistant_message": "Great. We'll start a blood pressure reading now.",
+                "tool_call": {
+                    "name": "start_measurement",
+                    "arguments": {"device_id": "BP-DEVICE", "measurement_type": "blood_pressure"},
+                },
+            }
+        return {
+            "state": "education",
+            "assistant_message": assistant_text,
+            "tool_call": {"name": None, "arguments": {}},
+        }
+
+    if section_state == "closing":
+        return {
+            "state": "closing",
+            "assistant_message": assistant_text,
+            "tool_call": {"name": None, "arguments": {}},
+        }
+
+    if section_state == "escalation":
+        reason = "critical symptoms"
+        if "chest pain" in lower:
+            reason = "chest pain"
+        elif "oxygen" in lower or "spo2" in lower:
+            reason = "low oxygen"
+        return {
+            "state": "escalation",
+            "assistant_message": "I'm sorry you're experiencing that. I can't provide medical advice, but this could be urgent. Please call your local emergency number now, and I'm escalating you to a nurse as well.",
+            "tool_call": {"name": "escalate_to_nurse", "arguments": {"reason": reason}},
+        }
+
+    return {
+        "state": section_state,
+        "assistant_message": assistant_text,
+        "tool_call": {"name": None, "arguments": {}},
+    }
+
+
+def write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def generate_synthetic(multiplier=10):
+    samples = []
+
+    onboarding_templates = [
+        "Hello, I received my RPM kit.",
+        "Hi, I just got the monitoring kit.",
+        "Good afternoon, I got the RPM package.",
+    ]
+    onboarding_verify = [
+        ("Emily", "Davis", "12/01/1959"),
+        ("Carlos", "Rivera", "04/22/1968"),
+        ("Priya", "Shah", "09/15/1974"),
+    ]
+
+    device_templates = [
+        "I'm setting up my pulse oximeter. Device ID is {device}.",
+        "Trying to pair my BP monitor {device}.",
+        "Need help pairing my thermometer {device}.",
+        "Please connect my scale. Device ID is {device}.",
+        "I want to set up my pulse oximeter. Device ID is {device}.",
+        "Set up my oximeter please. Device ID is {device}.",
+        "Please pair my pulse oximeter {device}.",
+        "Connect my blood pressure monitor {device}.",
+        "I need to set up my BP device {device}.",
+        "Help me set up my thermometer {device}.",
+    ]
+
+    device_templates_unknown = [
+        "I want to set up my device oximeter.",
+        "Help me set up my pulse oximeter.",
+        "Can you connect my blood pressure monitor?",
+        "Please pair my BP cuff.",
+        "I need to set up my device.",
+    ]
+
+    troubleshooting_templates = [
+        "Pairing failed twice for my BP device {device}.",
+        "The oximeter won't connect after two tries ({device}).",
+        "My scale won't pair even after retries ({device}).",
+    ]
+
+    education_templates = [
+        "How should I take my blood pressure correctly?",
+        "What's the right way to use the pulse oximeter?",
+        "How do I take my temperature with the RPM kit?",
+    ]
+
+    ready_templates = [
+        "Okay, I'm ready to take my BP now.",
+        "I'm ready to take my oxygen reading.",
+        "I'm ready to take my temperature.",
+    ]
+
+    measurement_request_templates = [
+        ("My device is paired. Measure my BP.", "blood_pressure"),
+        ("My device is already paired. Start my blood pressure reading.", "blood_pressure"),
+        ("The cuff is paired. Please take my blood pressure now.", "blood_pressure"),
+        ("My oximeter is paired. Measure my oxygen now.", "spo2"),
+        ("The pulse oximeter is connected. Start my oxygen reading.", "spo2"),
+        ("My thermometer is paired. Take my temperature now.", "temperature"),
+        ("The device is paired. Start the measurement.", "blood_pressure"),
+    ]
+
+    closing_templates = [
+        "That's all. Thanks.",
+        "No more questions. Thank you.",
+        "Okay, I'm done for now.",
+    ]
+
+    escalation_templates = [
+        "I'm having chest pain right now.",
+        "My oxygen is 88.",
+        "I'm short of breath and feel dizzy.",
+        "SpO2 is 88 and I feel unwell.",
+    ]
+
+    for _ in range(multiplier):
+        for text in onboarding_templates:
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "onboarding",
+                    "assistant_message": "Hi, this is the Outcomes Clinic RPM assistant. Please share your full name and date of birth (including year).",
+                    "tool_call": {"name": None, "arguments": {}},
+                },
+            })
+
+    for _ in range(multiplier):
+        for first, last, dob in onboarding_verify:
+            samples.append({
+                "user": f"My name is {first} {last}. My DOB is {dob}.",
+                "expected": {
+                    "state": "onboarding",
+                    "assistant_message": "Thank you. Let me verify your identity now.",
+                    "tool_call": {
+                        "name": "verify_identity",
+                        "arguments": {"first_name": first, "last_name": last, "dob": dob},
+                    },
+                },
+            })
+
+    for _ in range(multiplier):
+        for template in device_templates:
+            device_id = random.choice(["OXI-1023", "BP-8831", "TEMP-2001", "SCALE-77"])
+            samples.append({
+                "user": template.format(device=device_id),
+                "expected": {
+                    "state": "device_setup",
+                    "assistant_message": "Got it. I'll pair your device with the tablet now.",
+                    "tool_call": {"name": "pair_device", "arguments": {"device_id": device_id}},
+                },
+            })
+
+    for _ in range(multiplier):
+        for text in device_templates_unknown:
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "device_setup",
+                    "assistant_message": "Got it. I'll pair your device with the tablet now.",
+                    "tool_call": {"name": "pair_device", "arguments": {"device_id": "DEVICE-UNKNOWN"}},
+                },
+            })
+
+    for _ in range(multiplier):
+        for template in troubleshooting_templates:
+            device_id = random.choice(["BP-8831", "OXI-1023", "SCALE-77"])
+            samples.append({
+                "user": template.format(device=device_id),
+                "expected": {
+                    "state": "troubleshooting",
+                    "assistant_message": "Let's try a Bluetooth reset step and then re-pair.",
+                    "tool_call": {"name": "troubleshoot_step", "arguments": {"step_id": "bluetooth_reset"}},
+                },
+            })
+
+    for _ in range(multiplier):
+        samples.append({
+            "user": "I tried that and it still doesn't work.",
+            "expected": {
+                "state": "troubleshooting",
+                "assistant_message": "Thanks for the update. I'll log this and ask a support teammate to follow up.",
+                "tool_call": {"name": "troubleshoot_step", "arguments": {"step_id": "create_support_ticket"}},
+            },
+        })
+
+    for _ in range(multiplier):
+        for text in education_templates:
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "education",
+                    "assistant_message": "Sit quietly for 5 minutes, keep your feet flat, and keep your arm at heart level. Then start the measurement and stay still.",
+                    "tool_call": {"name": None, "arguments": {}},
+                },
+            })
+
+    for _ in range(multiplier):
+        for text in ready_templates:
+            measurement = "blood_pressure"
+            if "oxygen" in text.lower():
+                measurement = "spo2"
+            if "temperature" in text.lower():
+                measurement = "temperature"
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "education",
+                    "assistant_message": "Great. We'll start a measurement now.",
+                    "tool_call": {
+                        "name": "start_measurement",
+                        "arguments": {"device_id": "DEVICE-UNKNOWN", "measurement_type": measurement},
+                    },
+                },
+            })
+
+    for _ in range(multiplier):
+        for text, measurement in measurement_request_templates:
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "education",
+                    "assistant_message": "Great. We'll start a measurement now.",
+                    "tool_call": {
+                        "name": "start_measurement",
+                        "arguments": {"device_id": "DEVICE-UNKNOWN", "measurement_type": measurement},
+                    },
+                },
+            })
+
+    for _ in range(multiplier):
+        for text in closing_templates:
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "closing",
+                    "assistant_message": "You're welcome. Please remember to take your vitals daily using the tablet. Take care.",
+                    "tool_call": {"name": None, "arguments": {}},
+                },
+            })
+
+    for _ in range(multiplier):
+        for text in escalation_templates:
+            reason = "critical symptoms"
+            lower = text.lower()
+            if "chest pain" in lower:
+                reason = "chest pain"
+            elif "oxygen" in lower or "spo2" in lower:
+                reason = "low oxygen"
+            samples.append({
+                "user": text,
+                "expected": {
+                    "state": "escalation",
+                    "assistant_message": "I'm sorry you're experiencing that. I can't provide medical advice, but this could be urgent. Please call your local emergency number now, and I'm escalating you to a nurse as well.",
+                    "tool_call": {"name": "escalate_to_nurse", "arguments": {"reason": reason}},
+                },
+            })
+
+    return samples
+
+
+def main():
+    text = RAW_PATH.read_text(encoding="utf-8")
+    sections = parse_test_cases(text)
+
+    raw_rows = []
+    eval_rows = []
+
+    for section in sections:
+        section_key = normalize_section(section["title"])
+        state = SECTION_TO_STATE.get(section_key)
+        if not state:
+            continue
+        for idx, pair in enumerate(section["pairs"], start=1):
+            user_text = pair.get("user", "").strip()
+            assistant_text = pair.get("assistant", "").strip()
+            if not user_text:
+                continue
+            raw_rows.append({
+                "section": section["title"],
+                "pair_index": idx,
+                "user": user_text,
+                "assistant": assistant_text,
+                "state": state,
+            })
+
+            expected = expected_for_pair(state, user_text, assistant_text)
+            eval_rows.append({
+                "id": f"{state}_{idx}",
+                "user": user_text,
+                "expected": expected,
+            })
+
+    synthetic = generate_synthetic(multiplier=20)
+
+    sft_rows = []
+    for i, row in enumerate(synthetic, start=1):
+        expected = row["expected"]
+        sft_rows.append({
+            "id": f"sft_{i}",
+            "user": row["user"],
+            "assistant": json.dumps(expected, ensure_ascii=True, separators=(",", ":")),
+            "expected": expected,
+        })
+
+    random.shuffle(sft_rows)
+    split = int(len(sft_rows) * 0.85)
+    train_rows = sft_rows[:split]
+    val_rows = sft_rows[split:]
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    write_jsonl(DATA_DIR / "raw_cases.jsonl", raw_rows)
+    write_jsonl(DATA_DIR / "eval.jsonl", eval_rows)
+    write_jsonl(DATA_DIR / "sft_train.jsonl", train_rows)
+    write_jsonl(DATA_DIR / "sft_val.jsonl", val_rows)
+
+    print(f"Wrote {len(raw_rows)} raw cases")
+    print(f"Wrote {len(eval_rows)} eval cases")
+    print(f"Wrote {len(train_rows)} train cases, {len(val_rows)} val cases")
+
+
+if __name__ == "__main__":
+    main()
