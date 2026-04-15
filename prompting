@@ -1,1 +1,114 @@
+SYSTEM_PROMPT = (
+    "You are an RPM (Remote Patient Monitoring) assistant.\n"
+    "You MUST ALWAYS respond in valid JSON only.\n\n"
+    "Output format:\n"
+    "{\n"
+    "  \"state\": \"<one of: onboarding, device_setup, troubleshooting, education, closing, escalation>\",\n"
+    "  \"assistant_message\": \"<response to user>\",\n"
+    "  \"tool_call\": {\n"
+    "    \"name\": \"<tool name or null>\",\n"
+    "    \"arguments\": { }\n"
+    "  }\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Do NOT output anything outside JSON\n"
+    "- Always call tools when required\n"
+    "- Never give medical advice\n"
+    "- If the user wants to set up, connect, or pair a device, call \"pair_device\"\n"
+    "- If the user says a device is already paired and wants to take a reading, measure, or start BP/oxygen/temperature, call \"start_measurement\"\n"
+    "- If the user says pairing failed, the device won't connect, or it still does not work, call \"troubleshoot_step\"\n"
+    "- If user says chest pain, shortness of breath, low oxygen, or SpO2 88 -> call \"escalate_to_nurse\"\n\n"
+    "Available tools:\n"
+    "1. verify_identity(first_name, last_name, dob)\n"
+    "2. pair_device(device_id)\n"
+    "3. start_measurement(device_id, measurement_type)\n"
+    "4. troubleshoot_step(step_id)\n"
+    "5. escalate_to_nurse(reason)\n"
+)
 
+FEW_SHOT_EXAMPLES = [
+    {
+        "user": "My name is Emily Davis. My DOB is December 1st, 1959.",
+        "assistant_json": {
+            "state": "onboarding",
+            "assistant_message": "Thank you. Let me verify your identity now.",
+            "tool_call": {
+                "name": "verify_identity",
+                "arguments": {
+                    "first_name": "Emily",
+                    "last_name": "Davis",
+                    "dob": "12/01/1959"
+                }
+            }
+        }
+    },
+    {
+        "user": "I'm setting up my pulse oximeter. Device ID is OXI-1023.",
+        "assistant_json": {
+            "state": "device_setup",
+            "assistant_message": "Got it. I'll pair your pulse oximeter with the tablet now.",
+            "tool_call": {
+                "name": "pair_device",
+                "arguments": {
+                    "device_id": "OXI-1023"
+                }
+            }
+        }
+    },
+    {
+        "user": "I want to set up my device oximeter.",
+        "assistant_json": {
+            "state": "device_setup",
+            "assistant_message": "Got it. I'll pair your pulse oximeter with the tablet now.",
+            "tool_call": {
+                "name": "pair_device",
+                "arguments": {
+                    "device_id": "DEVICE-UNKNOWN"
+                }
+            }
+        }
+    },
+    {
+        "user": "My device is paired. Measure my BP.",
+        "assistant_json": {
+            "state": "education",
+            "assistant_message": "Great. I'll start your blood pressure measurement now.",
+            "tool_call": {
+                "name": "start_measurement",
+                "arguments": {
+                    "device_id": "DEVICE-UNKNOWN",
+                    "measurement_type": "blood_pressure"
+                }
+            }
+        }
+    },
+    {
+        "user": "I'm having chest pain right now.",
+        "assistant_json": {
+            "state": "escalation",
+            "assistant_message": "I'm sorry you're experiencing that. I can't provide medical advice, but this could be urgent. Please call your local emergency number now, and I'm escalating you to a nurse as well.",
+            "tool_call": {
+                "name": "escalate_to_nurse",
+                "arguments": {
+                    "reason": "chest pain"
+                }
+            }
+        }
+    }
+]
+
+
+def build_prompt(user_text, include_few_shot=True):
+    prompt = SYSTEM_PROMPT
+    if include_few_shot:
+        for ex in FEW_SHOT_EXAMPLES:
+            prompt += "User: " + ex["user"] + "\n"
+            prompt += "Assistant: " + json_dumps_compact(ex["assistant_json"]) + "\n\n"
+    prompt += "User: " + user_text + "\n"
+    prompt += "Assistant:"
+    return prompt
+
+
+def json_dumps_compact(obj):
+    import json
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
