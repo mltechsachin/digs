@@ -9,6 +9,7 @@ Example:
 import argparse
 import csv
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -53,7 +54,7 @@ def main():
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
     from peft import PeftModel
 
     rows = [
@@ -69,9 +70,10 @@ def main():
     model = PeftModel.from_pretrained(base, args.adapter_dir)
     model.eval()
 
-    output_dir = Path(args.adapter_dir)
+    output_dir = Path(args.adapter_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     pred_path = output_dir / "eval_predictions_peft.jsonl"
+    print(f"Resolved output directory: {output_dir}")
 
     totals = {
         "state_correct": 0,
@@ -79,24 +81,41 @@ def main():
         "tool_args_correct": 0,
         "count": 0,
     }
+    ttft_values = []
     total_times = []
 
     with open(pred_path, "w", encoding="utf-8") as f:
         for row in rows:
             prompt = build_prompt(row["user"], include_few_shot=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            streamer = TextIteratorStreamer(
+                tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+            )
+            generation_kwargs = dict(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                streamer=streamer,
+            )
 
+            generated_chunks = []
+            ttft = None
             start = time.time()
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                )
+            worker = threading.Thread(
+                target=model.generate,
+                kwargs=generation_kwargs,
+            )
+            worker.start()
+            for chunk in streamer:
+                if ttft is None:
+                    ttft = time.time() - start
+                generated_chunks.append(chunk)
+            worker.join()
             total_time = time.time() - start
 
-            decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            raw_output = decoded[len(prompt) :].strip()
+            raw_output = "".join(generated_chunks).strip()
             parsed = safe_json_parse(raw_output) or {}
             expected = row["expected"]
 
@@ -111,6 +130,8 @@ def main():
             totals["state_correct"] += int(state_ok)
             totals["tool_name_correct"] += int(tool_name_ok)
             totals["tool_args_correct"] += int(tool_args_ok)
+            if ttft is not None:
+                ttft_values.append(ttft)
             total_times.append(total_time)
 
             record = {
@@ -122,6 +143,7 @@ def main():
                 "state_correct": state_ok,
                 "tool_name_correct": tool_name_ok,
                 "tool_args_correct": tool_args_ok,
+                "ttft": ttft,
                 "total_time": total_time,
             }
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
@@ -138,6 +160,7 @@ def main():
         "adapter_dir": args.adapter_dir,
         "accuracy": accuracy,
         "latency": {
+            "ttft_avg": sum(ttft_values) / len(ttft_values) if ttft_values else None,
             "total_time_avg": sum(total_times) / len(total_times) if total_times else None,
         },
     }
@@ -151,6 +174,7 @@ def main():
         writer.writerow(["metric", "value"])
         for key, value in accuracy.items():
             writer.writerow([key, value])
+        writer.writerow(["ttft_avg", report["latency"]["ttft_avg"]])
         writer.writerow(["total_time_avg", report["latency"]["total_time_avg"]])
 
     print(f"Wrote {pred_path}")
