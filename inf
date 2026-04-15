@@ -1,0 +1,84 @@
+"""Interactive inference for a PEFT fine-tuned model.
+
+Loads a base Hugging Face model plus a LoRA adapter from a local directory.
+Prints only the model's JSON output for each user query.
+
+Example:
+  python3 code/infer_peft.py --base_model Qwen/Qwen2.5-7B-Instruct --adapter_dir outputs/lora
+"""
+
+import argparse
+import json
+
+from prompting import build_prompt
+
+
+def safe_json_parse(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return None
+
+
+def extract_assistant_message(text):
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if "Assistant:" in stripped:
+        return stripped.split("Assistant:", 1)[1].strip()
+    return stripped
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--adapter_dir", default="outputs/lora")
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    args = parser.parse_args()
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    base = AutoModelForCausalLM.from_pretrained(args.base_model, device_map="auto")
+    model = PeftModel.from_pretrained(base, args.adapter_dir)
+    model.eval()
+
+    print("Enter 'exit' to quit.")
+    while True:
+        user_text = input("User: ").strip()
+        if not user_text:
+            continue
+        if user_text.lower() == "exit":
+            break
+
+        prompt = build_prompt(user_text, include_few_shot=True)
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+        )
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = decoded[len(prompt):].strip()
+
+        parsed = safe_json_parse(response)
+        if parsed is not None:
+            assistant_message = parsed.get("assistant_message")
+            if assistant_message:
+                print(f"Assistant: {assistant_message}")
+            print(json.dumps(parsed, ensure_ascii=True, indent=2))
+        else:
+            print(f"Assistant: {extract_assistant_message(response)}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
