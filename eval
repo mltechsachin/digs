@@ -1,0 +1,162 @@
+"""Evaluate a PEFT/LoRA adapter on the assignment eval set.
+
+Example:
+  python3 code/evaluate_peft.py \
+    --base_model Qwen/Qwen2.5-7B-Instruct \
+    --adapter_dir outputs/qlora
+"""
+
+import argparse
+import csv
+import json
+import time
+from pathlib import Path
+
+from prompting import build_prompt
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+OUT_DIR = ROOT / "outputs"
+
+
+def safe_json_parse(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return None
+
+
+def compare_tool_args(expected_args, actual_args):
+    if expected_args is None:
+        return actual_args in (None, {})
+    if not isinstance(actual_args, dict):
+        return False
+    for key, value in expected_args.items():
+        if actual_args.get(key) != value:
+            return False
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--adapter_dir", default="outputs/qlora")
+    parser.add_argument("--eval_data", default="data/eval.jsonl")
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--limit", type=int, default=0)
+    args = parser.parse_args()
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    rows = [
+        json.loads(line)
+        for line in Path(args.eval_data).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if args.limit > 0:
+        rows = rows[: args.limit]
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    base = AutoModelForCausalLM.from_pretrained(args.base_model, device_map="auto")
+    model = PeftModel.from_pretrained(base, args.adapter_dir)
+    model.eval()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    pred_path = OUT_DIR / "eval_predictions_peft.jsonl"
+
+    totals = {
+        "state_correct": 0,
+        "tool_name_correct": 0,
+        "tool_args_correct": 0,
+        "count": 0,
+    }
+    total_times = []
+
+    with open(pred_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            prompt = build_prompt(row["user"], include_few_shot=True)
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+            start = time.time()
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,
+                )
+            total_time = time.time() - start
+
+            decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            raw_output = decoded[len(prompt) :].strip()
+            parsed = safe_json_parse(raw_output) or {}
+            expected = row["expected"]
+
+            state_ok = parsed.get("state") == expected.get("state")
+            tool_name_ok = (parsed.get("tool_call") or {}).get("name") == expected.get("tool_call", {}).get("name")
+            tool_args_ok = compare_tool_args(
+                expected.get("tool_call", {}).get("arguments"),
+                (parsed.get("tool_call") or {}).get("arguments"),
+            )
+
+            totals["count"] += 1
+            totals["state_correct"] += int(state_ok)
+            totals["tool_name_correct"] += int(tool_name_ok)
+            totals["tool_args_correct"] += int(tool_args_ok)
+            total_times.append(total_time)
+
+            record = {
+                "id": row["id"],
+                "user": row["user"],
+                "expected": expected,
+                "raw_output": raw_output,
+                "parsed": parsed,
+                "state_correct": state_ok,
+                "tool_name_correct": tool_name_ok,
+                "tool_args_correct": tool_args_ok,
+                "total_time": total_time,
+            }
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    accuracy = {
+        "state_accuracy": totals["state_correct"] / totals["count"] if totals["count"] else 0.0,
+        "tool_name_accuracy": totals["tool_name_correct"] / totals["count"] if totals["count"] else 0.0,
+        "tool_args_accuracy": totals["tool_args_correct"] / totals["count"] if totals["count"] else 0.0,
+        "count": totals["count"],
+    }
+
+    report = {
+        "base_model": args.base_model,
+        "adapter_dir": args.adapter_dir,
+        "accuracy": accuracy,
+        "latency": {
+            "total_time_avg": sum(total_times) / len(total_times) if total_times else None,
+        },
+    }
+
+    report_path = OUT_DIR / "report_peft.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    csv_path = OUT_DIR / "report_peft.csv"
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        for key, value in accuracy.items():
+            writer.writerow([key, value])
+        writer.writerow(["total_time_avg", report["latency"]["total_time_avg"]])
+
+    print(f"Wrote {pred_path}")
+    print(f"Wrote {report_path}")
+    print(f"Wrote {csv_path}")
+
+
+if __name__ == "__main__":
+    main()
