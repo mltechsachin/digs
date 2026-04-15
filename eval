@@ -16,7 +16,6 @@ from prompting import build_prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
-OUT_DIR = ROOT / "outputs"
 
 
 def safe_json_parse(text):
@@ -70,8 +69,9 @@ def main():
     model = PeftModel.from_pretrained(base, args.adapter_dir)
     model.eval()
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    pred_path = OUT_DIR / "eval_predictions_peft.jsonl"
+    output_dir = Path(args.adapter_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pred_path = output_dir / "eval_predictions_peft.jsonl"
 
     totals = {
         "state_correct": 0,
@@ -142,10 +142,10 @@ def main():
         },
     }
 
-    report_path = OUT_DIR / "report_peft.json"
+    report_path = output_dir / "report_peft.json"
     report_path.write_text(json.dumps(report, ensure_ascii=True, indent=2), encoding="utf-8")
 
-    csv_path = OUT_DIR / "report_peft.csv"
+    csv_path = output_dir / "report_peft.csv"
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["metric", "value"])
